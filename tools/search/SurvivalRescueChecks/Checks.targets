@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <StartupObject>OfflineSearchHarness.SurvivalRescueChecks</StartupObject>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)SurvivalRescueChecks.cs" />
+  </ItemGroup>
+</Project>
