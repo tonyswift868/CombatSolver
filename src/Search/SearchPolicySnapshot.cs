@@ -58,6 +58,8 @@ internal sealed record SearchPolicySnapshot(
     /// </summary>
     public bool EnableTurnBoundaryRollouts { get; init; } = true;
 
+    public int? ExplicitSearchMaxExpandedNodes { get; init; }
+
     public bool StopAtAcceptableBattleHpLoss { get; init; } = true;
 
     public bool CanStopAtHpTarget => StopAtAcceptableBattleHpLoss

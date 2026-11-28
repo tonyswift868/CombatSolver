@@ -167,6 +167,7 @@ internal sealed record SolverSettingsSnapshot(
     public bool IgnoreLongTermRewards { get; init; }
     public bool PredictPotionReward { get; init; }
     public PotionHpThresholds PotionThresholds { get; init; } = PotionHpThresholds.Default;
+    public int? ExplicitSearchMaxExpandedNodes { get; init; }
     public int MaxCombatSolveSeconds { get; init; } = SolverSettings.DefaultMaxCombatSolveSeconds;
     public bool AdaptiveEscalationEnabled { get; init; } = true;
 }
@@ -332,6 +333,7 @@ internal static class SolverSettings
             PredictPotionReward = data.PredictPotionReward,
             PotionThresholds = ResolvePotionThresholds(data),
             MaxCombatSolveSeconds = data.MaxCombatSolveSeconds,
+            ExplicitSearchMaxExpandedNodes = data.SearchMaxExpandedNodes,
             AdaptiveEscalationEnabled = true,
         };
     }

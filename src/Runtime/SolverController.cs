@@ -471,6 +471,7 @@ internal static partial class SolverController
             IgnoreLongTermRewards = settings.IgnoreLongTermRewards,
             AdaptiveEscalationEnabled = settings.AdaptiveEscalationEnabled,
             MaxCombatSolveSeconds = settings.MaxCombatSolveSeconds,
+            ExplicitSearchMaxExpandedNodes = settings.ExplicitSearchMaxExpandedNodes,
         };
         CombatBugReportExporter.RecordSearchPolicy(state, policy);
         return policy;

@@ -396,7 +396,8 @@ internal static class HotSearchCoordinator
                 string potionPhaseLabel,
                 HotSearchBudget stageBudget,
                 bool allowDeathSaveRescue,
-                SolverSearchProfile? profileOverride = null)
+                SolverSearchProfile? profileOverride = null,
+                bool survivalOnly = false)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (stageNumber > 1 && (stageBudget.IsTimeExpired || totalExpanded >= stageNodeCeiling))
@@ -520,7 +521,8 @@ internal static class HotSearchCoordinator
                         reviewedOffset: totalExpanded,
                         enableTurnBoundaryRollouts: policy.EnableTurnBoundaryRollouts,
                         rolloutHorizonTurns: rolloutHorizonTurns,
-                        allowDeathSaveRescue: allowDeathSaveRescue);
+                        allowDeathSaveRescue: allowDeathSaveRescue,
+                        preferDefeatFallback: survivalOnly);
 
                     AccumulatePassTotals(phaseA,
                         ref totalExpanded, ref totalTransitions, ref totalChoices, ref totalAllocated,
@@ -544,7 +546,7 @@ internal static class HotSearchCoordinator
                         baselineKey = phaseAKey;
                     }
 
-                    if (!hasBestPass || IsBetterPassOutcome(in phaseA, in bestPass, in hotPolicy))
+                    if (!hasBestPass || IsBetterPassOutcome(in phaseA, in bestPass, in hotPolicy, survivalOnly))
                     {
                         hasBestPass = true;
                         bestPass = phaseA;
@@ -571,6 +573,8 @@ internal static class HotSearchCoordinator
                 }
 
                 completedEscalationStage = stageNumber;
+                if (survivalOnly && (bestPass.HasVictory || exhaustedAllowedPotionSearch))
+                    return phaseAWasLosslesslyExhausted;
 
                 // Phase B: Smart Paid-Potion pass (exact sound upper-bound gate, reusing remaining stage nodes).
                 bool bestPassUnimprovablePaidWin = IsUnimprovablePaidWin(
@@ -689,7 +693,8 @@ internal static class HotSearchCoordinator
                     reviewedOffset: totalExpanded,
                     enableTurnBoundaryRollouts: policy.EnableTurnBoundaryRollouts,
                     rolloutHorizonTurns: rolloutHorizonTurns,
-                    allowDeathSaveRescue: phaseBAllowDeathSaveRescue);
+                    allowDeathSaveRescue: phaseBAllowDeathSaveRescue,
+                    preferDefeatFallback: survivalOnly);
 
                 retention.RelaxZeroPotionReserve = false;
                 retention.MinZeroPotionReservePercent = 0;
@@ -704,7 +709,7 @@ internal static class HotSearchCoordinator
                     stage1PhaseBTimedOut = true;
 
                 HotRouteKey phaseBKey = phaseB.BestKey;
-                if (!hasBestPass || IsBetterPassOutcome(in phaseB, in bestPass, in hotPolicy))
+                if (!hasBestPass || IsBetterPassOutcome(in phaseB, in bestPass, in hotPolicy, survivalOnly))
                 {
                     potionHpSaved = phaseBKey.OptionalPaidPotionCount > 0
                         ? HotPotionPolicy.HpSavedWholeHp(in baselineKey, in phaseBKey)
@@ -959,44 +964,48 @@ internal static class HotSearchCoordinator
                 }
             }
 
-            bool CanSearchForSurvival() => !bestPass.HasVictory && !exhaustedAllowedPotionSearch
-                && totalExpanded < fullBudget.MaxExpandedNodes && fullBudget.RemainingMilliseconds >= 400;
-
-            void SearchForSurvival(int width, HotEvalMode mode, bool allowDeathSaveRescue,
-                SolverSearchProfile? profileOverride = null)
-            {
-                RunAdaptiveStage(
-                    stageNumber: 3,
-                    stageWidth: width,
-                    stageNodeCeiling: fullBudget.MaxExpandedNodes,
-                    rolloutHorizonTurns: Stage3RolloutHorizon,
-                    stageEvalMode: mode,
-                    mainPhaseLabel: "正在深度搜索路线",
-                    potionPhaseLabel: "正在深度评估药水路线",
-                    stageBudget: fullBudget,
-                    allowDeathSaveRescue: allowDeathSaveRescue,
-                    profileOverride: profileOverride);
-            }
-
-            bool ranSurvivalSearch = CanSearchForSurvival();
+            int survivalNodeCeiling = policy.ExplicitSearchMaxExpandedNodes ?? int.MaxValue;
+            bool ranSurvivalSearch = !bestPass.HasVictory && !exhaustedAllowedPotionSearch
+                && totalExpanded < survivalNodeCeiling && fullBudget.RemainingMilliseconds >= 400;
             if (ranSurvivalSearch)
             {
-                if (allowForcedPotions)
+                HotSearchBudget survivalBudget = new(requestClock, survivalNodeCeiling, softBudgetMs, cancellationToken);
+                retention.RaiseForcedZeroPotionReserve = allowForcedPotions;
+
+                bool CanSearchForSurvival() => !bestPass.HasVictory && !exhaustedAllowedPotionSearch
+                    && totalExpanded < survivalNodeCeiling && !survivalBudget.IsTimeExpired;
+
+                void SearchForSurvival(int width, HotEvalMode mode, bool allowDeathSaveRescue,
+                    SolverSearchProfile? profileOverride = null)
                 {
-                    retention.RaiseForcedZeroPotionReserve = true;
-                    SearchForSurvival(stage3Width, HotEvalMode.Offense, allowDeathSaveRescue: true);
+                    if (policy.MeasurePhasePerformance)
+                        policy.Diagnostics.Info($"SURVIVAL_RESCUE width={width} mode={mode} expanded={totalExpanded}");
+                    RunAdaptiveStage(
+                        stageNumber: 3,
+                        stageWidth: width,
+                        stageNodeCeiling: survivalNodeCeiling,
+                        rolloutHorizonTurns: Stage3RolloutHorizon,
+                        stageEvalMode: mode,
+                        mainPhaseLabel: "正在深度搜索路线",
+                        potionPhaseLabel: "正在深度评估药水路线",
+                        stageBudget: survivalBudget,
+                        allowDeathSaveRescue: allowDeathSaveRescue,
+                        profileOverride: profileOverride,
+                        survivalOnly: true);
                 }
-                else
+
+                if (allowForcedPotions)
+                    SearchForSurvival(stage3Width, HotEvalMode.Offense, allowDeathSaveRescue: true);
+
+                SolverSearchProfile setupProfile = policy.Profile with
                 {
-                    SearchForSurvival(HotSearchConstants.MaxBeamWidth, HotEvalMode.Balanced, allowDeathSaveRescue: true);
+                    MaxPileChoiceBranchesPerAction = Math.Max(64, policy.Profile.MaxPileChoiceBranchesPerAction),
+                };
+                for (int width = HotSearchConstants.MaxBeamWidth; CanSearchForSurvival(); width = checked(width * 2))
+                {
+                    SearchForSurvival(width, HotEvalMode.Balanced, allowDeathSaveRescue: true);
                     if (CanSearchForSurvival())
-                    {
-                        SearchForSurvival(HotSearchConstants.MaxBeamWidth, HotEvalMode.SetupAndSurvival,
-                            allowDeathSaveRescue: false, profileOverride: policy.Profile with
-                            {
-                                MaxPileChoiceBranchesPerAction = Math.Max(64, policy.Profile.MaxPileChoiceBranchesPerAction),
-                            });
-                    }
+                        SearchForSurvival(width, HotEvalMode.SetupAndSurvival, allowDeathSaveRescue: false, setupProfile);
                 }
             }
 
@@ -1008,13 +1017,25 @@ internal static class HotSearchCoordinator
                 && (!smartMode
                     || !HotPotionPolicy.CanAnyPaidPotionImproveOn(
                         in bestPassKey, in hotPolicy, rootPotionCosts, in rootState, rootBundle.Rules));
-            int effectiveFinalNodeCeiling = bestPass.HasVictory && !ranSurvivalSearch
-                ? stage3NodeCeiling : fullBudget.MaxExpandedNodes;
-            SearchBoundaryReason finalBoundaryReason = ResolveEffectiveBoundaryReason(
-                in bestPass,
-                postBestBoundary,
-                overallTimeExpired: !reachedGlobalStopTarget && fullBudget.IsTimeExpired,
-                overallNodeLimitReached: !reachedGlobalStopTarget && totalExpanded >= effectiveFinalNodeCeiling);
+            int effectiveFinalNodeCeiling = ranSurvivalSearch ? survivalNodeCeiling
+                : bestPass.HasVictory ? stage3NodeCeiling : fullBudget.MaxExpandedNodes;
+            bool overallTimeExpired = !reachedGlobalStopTarget && fullBudget.IsTimeExpired;
+            bool overallNodeLimitReached = !reachedGlobalStopTarget && totalExpanded >= effectiveFinalNodeCeiling;
+            SearchBoundaryReason finalBoundaryReason;
+            if (ranSurvivalSearch && !bestPass.OnlyDeathRoutes && !bestPass.BestKey.IsEventDefeat)
+            {
+                finalBoundaryReason = !bestPass.HasVictory && bestPass.BestKey.Survives
+                    ? SearchBoundaryReason.IncompleteSurvivalSearch
+                    : overallTimeExpired ? SearchBoundaryReason.TimeLimit
+                    : overallNodeLimitReached ? SearchBoundaryReason.NodeLimit
+                    : bestPass.HasVictory ? SearchBoundaryReason.None
+                    : SearchBoundaryReason.IncompleteSurvivalSearch;
+            }
+            else
+            {
+                finalBoundaryReason = ResolveEffectiveBoundaryReason(
+                    in bestPass, postBestBoundary, overallTimeExpired, overallNodeLimitReached);
+            }
 
             SolverResult finalResult;
             if (bestPassInArena && hasBestPass)
@@ -1149,7 +1170,8 @@ internal static class HotSearchCoordinator
         long reviewedOffset,
         bool enableTurnBoundaryRollouts = true,
         int rolloutHorizonTurns = 4,
-        bool allowDeathSaveRescue = false)
+        bool allowDeathSaveRescue = false,
+        bool preferDefeatFallback = false)
     {
         Stopwatch passClock = Stopwatch.StartNew();
         int gen0Start = GC.CollectionCount(0);
@@ -1258,8 +1280,9 @@ internal static class HotSearchCoordinator
             evalMode: evalMode,
             enableTurnBoundaryRollouts: turnBoundaryRolloutsActive);
 
-        int earlyTurnBoundaryWidth = Math.Min(HotSearchConstants.MaxBeamWidth, (beamWidth * 3) / 2);
-        int earlyMidTurnWidth = Math.Min(HotSearchConstants.MaxBeamWidth, (beamWidth * 5) / 4);
+        int roundWidthLimit = Math.Max(HotSearchConstants.MaxBeamWidth, beamWidth);
+        int earlyTurnBoundaryWidth = (int)Math.Min(roundWidthLimit, ((long)beamWidth * 3) / 2);
+        int earlyMidTurnWidth = (int)Math.Min(roundWidthLimit, ((long)beamWidth * 5) / 4);
         int maxFrontierWidth = Math.Max(beamWidth, earlyTurnBoundaryWidth);
         int maxMidTurnWidth = Math.Max(beamWidth, earlyMidTurnWidth);
 
@@ -2099,9 +2122,10 @@ internal static class HotSearchCoordinator
             onlyDeathRoutes = false;
             isMidTurnFallback = false;
         }
-        else if (retainedFrontierEndedInDefeat)
+        else if (retainedFrontierEndedInDefeat
+            || (preferDefeatFallback && hasBestFallback && !bestFallbackKey.Survives))
         {
-            // Keep the terminal fallback so DeathTurn remains available even after lossy pruning.
+            // Keep DeathTurn when survival rescue saw a terminal fallback before its budget expired.
             chosenId = bestFallbackId;
             chosenKey = bestFallbackKey;
             chosenHasCompletedTurnOngoing = false;
@@ -2387,7 +2411,8 @@ internal static class HotSearchCoordinator
     private static bool IsBetterPassOutcome(
         in HotPassOutcome candidate,
         in HotPassOutcome current,
-        in HotSearchPolicy hotPolicy)
+        in HotSearchPolicy hotPolicy,
+        bool preferDefeatFallback)
     {
         HotRouteKey candidateKey = candidate.BestKey;
         if (!candidate.HasBest || !HotPotionPolicy.SatisfiesHardConstraints(in candidateKey, in hotPolicy))
@@ -2416,6 +2441,9 @@ internal static class HotSearchCoordinator
 
         if (candidate.OnlyDeathRoutes != current.OnlyDeathRoutes)
             return candidate.OnlyDeathRoutes;
+
+        if (preferDefeatFallback && candidateKey.Survives != currentKey.Survives)
+            return !candidateKey.Survives;
 
         if (candidate.HasCompletedTurnOngoing != current.HasCompletedTurnOngoing)
             return candidate.HasCompletedTurnOngoing;
@@ -2663,9 +2691,10 @@ internal static class HotSearchCoordinator
 
     private static int ResolveStagePotionBeamWidth(int stageBeamWidth)
     {
-        int safeBase = Math.Clamp(stageBeamWidth, 4, HotSearchConstants.MaxBeamWidth);
+        int roundWidthLimit = Math.Max(HotSearchConstants.MaxBeamWidth, stageBeamWidth);
+        int safeBase = Math.Max(stageBeamWidth, 4);
         long scaled = ((long)safeBase * 5L) / 4L;
-        int width = (int)Math.Min((long)HotSearchConstants.MaxBeamWidth, scaled);
+        int width = (int)Math.Min(roundWidthLimit, scaled);
         return Math.Max(safeBase, width);
     }
 

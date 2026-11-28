@@ -51,6 +51,18 @@ internal static class SurvivalRescueChecks
             var policy = SolverController.CaptureSearchPolicy(SolverSettings.Capture(), combat,
                 includeTurnSetup: false, theftPolicy: setup.Request.TheftPolicyForTest ?? SolverController.ResolveTheftPolicy(combat));
             double? firstWinMs = null;
+            List<string> rescueRounds = [];
+            policy = policy with
+            {
+                MeasurePhasePerformance = true,
+                Diagnostics = new SearchDiagnosticsSink(message =>
+                {
+                    if (!message.StartsWith("SURVIVAL_RESCUE ", StringComparison.Ordinal))
+                        return;
+                    rescueRounds.Add(message);
+                    Console.WriteLine($"RESCUE_TICK {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()} {message}");
+                }, _ => { }),
+            };
             using var process = Process.GetCurrentProcess();
             TimeSpan cpuStart = process.TotalProcessorTime;
             var timer = Stopwatch.StartNew();
@@ -63,6 +75,7 @@ internal static class SurvivalRescueChecks
                 onPreliminaryResult: Observe);
             Observe(result);
             timer.Stop();
+            Console.WriteLine($"RESCUE_END {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
             process.Refresh();
             double cpuMs = (process.TotalProcessorTime - cpuStart).TotalMilliseconds;
             long peakWorkingSet = process.PeakWorkingSet64;
@@ -106,6 +119,8 @@ internal static class SurvivalRescueChecks
                 PeakWorkingSetBytes = peakWorkingSet,
                 BudgetMs = settings.MaxCombatSolveSeconds * 1000,
                 ConfiguredNodeBudget = settings.SearchMaxExpandedNodes,
+                Dop = policy.MaxDegreeOfParallelism,
+                RescueRounds = rescueRounds,
                 RouteSha = Convert.ToHexString(SHA256.HashData(routeJson)),
                 Root = root.ContinuationStamp.StateText,
                 forced, used, nativeOutcome, nativeHp, english, chinese,
@@ -127,7 +142,7 @@ internal static class SurvivalRescueChecks
                 && record.ConfiguredNodeBudget is int nodes && result.TotalExpandedNodes >= nodes;
             bool valid = expectation switch
             {
-                "control" => won,
+                "control" => won && rescueRounds.Count == 0,
                 "victory" => validWin,
                 "forced-victory" => validWin && forced.ToHashSet().SetEquals(["0:POWER_POTION", "1:COLORLESS_POTION"]),
                 "rescue" => validWin || (!won && hitConfiguredBudget && !result.OnlyDeathRoutesFound

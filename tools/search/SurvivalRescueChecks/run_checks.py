@@ -3,6 +3,7 @@ import argparse
 import ctypes
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -27,6 +28,14 @@ BOSS_FORCE_CASES = [
     for case in REGRESSIONS[:2] for mode in ("both", "0", "1")
 ]
 REGRESSIONS += BOSS_FORCE_CASES
+BUDGET_CASES = {
+    "15-holdout-04-necrobinder-hp28-node-budget": {"searchMaxExpandedNodes": 60_000},
+    "15-holdout-04-necrobinder-hp28-time-budget": {"maxCombatSolveSeconds": 5},
+}
+REGRESSIONS += [
+    (case_id, CORPUS + "holdout-04-necrobinder.json", FORCE | {"playerCurrentHp": 28}, "rescue")
+    for case_id in BUDGET_CASES
+]
 CONTROLS = [
     ("00-sentinel-potions", CORPUS + "sentinel-potions.json", {}),
     ("01-GA-IRONCLAD-ELITE-00", "coverage/corpora/strategy/roots/GA-IRONCLAD-ELITE-00-spec.json", {}),
@@ -45,15 +54,71 @@ class MemoryStatus(ctypes.Structure):
         ("total_phys", "avail_phys", "total_commit", "avail_commit", "total_virtual", "avail_virtual", "extended")
     ]
 
-def memory_available():
+class ProcessMemory(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_ulong), ("faults", ctypes.c_ulong)] + [
+        (name, ctypes.c_size_t) for name in
+        ("peak_ws", "ws", "peak_paged", "paged", "peak_nonpaged", "nonpaged", "commit", "peak_commit")
+    ]
+
+
+def current_memory():
     status = MemoryStatus()
     status.size = ctypes.sizeof(status)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise ctypes.WinError()
+    return status.avail_phys // 2**20, status.avail_commit // 2**20
+
+
+def memory_available():
     while True:
-        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            raise ctypes.WinError()
-        if min(status.avail_phys, status.avail_commit) >= 2 * 1024**3:
-            return {"physicalMiB": status.avail_phys // 2**20, "commitMiB": status.avail_commit // 2**20}
+        physical, commit = current_memory()
+        if min(physical, commit) >= 2048:
+            return {"physicalMiB": physical, "commitMiB": commit}
         time.sleep(20)
+
+
+def measure_child(command, env, dest):
+    samples = []
+    output_path = dest / "run.log"
+    counters = ProcessMemory()
+    counters.size = ctypes.sizeof(counters)
+    sample_process = ctypes.windll.psapi.GetProcessMemoryInfo
+    sample_process.argtypes = (ctypes.c_void_p, ctypes.POINTER(ProcessMemory), ctypes.c_ulong)
+    with output_path.open("wb") as output, subprocess.Popen(
+            command, env=env, cwd=REPO, stdout=output, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW) as child:
+        deadline = time.monotonic() + 180
+        while child.poll() is None:
+            now = time.time_ns() // 1_000_000
+            physical, commit = current_memory()
+            working_set = 0
+            if sample_process(int(child._handle), ctypes.byref(counters), counters.size):
+                working_set = counters.ws
+            samples.append((now, physical, commit, working_set))
+            if min(physical, commit) < 2048 or time.monotonic() >= deadline:
+                child.terminate()
+                child.wait(timeout=5)
+                write(dest / "memory-stop.json", {"samples": samples, "rounds": measure_rounds(output_path, samples)})
+                raise SystemExit(f"Stopped {dest}: host physical/commit {physical}/{commit} MiB, or child timeout.")
+            time.sleep(0.05)
+        return child.returncode, samples
+
+
+def measure_rounds(path, samples):
+    log = path.read_text(encoding="utf-8", errors="replace")
+    marks = list(re.finditer(r"^RESCUE_TICK (\d+) SURVIVAL_RESCUE width=(\d+) mode=(\w+) expanded=(\d+)", log, re.M))
+    end = re.search(r"^RESCUE_END (\d+)", log, re.M)
+    rows = []
+    for index, match in enumerate(marks):
+        start, width, mode, expanded = match.groups()
+        cutoff = int(marks[index + 1][1]) if index + 1 < len(marks) else int(end[1]) if end else float("inf")
+        points = [sample for sample in samples if int(start) <= sample[0] < cutoff]
+        rows.append({"width": int(width), "mode": mode, "startingNodes": int(expanded),
+                     "samples": len(points),
+                     "peakWorkingSetBytes": max((point[3] for point in points), default=None),
+                     "minHostPhysicalMiB": min((point[1] for point in points), default=None),
+                     "minHostCommitMiB": min((point[2] for point in points), default=None)})
+    return rows
 
 def read(path):
     return json.loads(path.read_text(encoding="utf-8-sig"))
@@ -88,22 +153,28 @@ def run_case(args, case, side, dll):
         expected_force = {f"{item['slot']}:{item['potionId']}" for item in settings["potionDirectives"]}
     elif expectation == "rescue":
         expected_force = {"0:POWER_POTION", "1:COLORLESS_POTION"}
+    if case_id in BUDGET_CASES:
+        settings_path = dest / "settings.json"
+        write(settings_path, read(args.settings) | BUDGET_CASES[case_id])
     memory = memory_available()
     env = os.environ | {"OFFLINE_HARNESS_COMBATSOLVER_DLL": str(dll)}
-    with (dest / "run.log").open("wb") as output:
-        check = subprocess.run(
-            [str(Path(env["DOTNET_ROOT"]) / "dotnet.exe"), str(args.harness),
-             str(request_path), str(settings_path), str(dest), expectation],
-            env=env, cwd=REPO, stdout=output, stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW, timeout=180)
+    command = [str(Path(env["DOTNET_ROOT"]) / "dotnet.exe"), str(args.harness),
+               str(request_path), str(settings_path), str(dest), expectation]
+    code, samples = measure_child(command, env, dest)
     result_path = dest / "result.json"
     if not result_path.exists():
         raise RuntimeError(f"No result from {case_id}/{side}. Read {dest / 'run.log'}")
-    row = read(result_path) | {"case": case_id, "side": side, "exit": check.returncode, "memory": memory}
+    row = read(result_path) | {
+        "case": case_id, "side": side, "exit": code, "memory": memory,
+        "roundMemory": measure_rounds(dest / "run.log", samples),
+        "minHostPhysicalMiB": min((point[1] for point in samples), default=None),
+        "minHostCommitMiB": min((point[2] for point in samples), default=None),
+    }
+    write(dest / "measurement.json", row)
     if expected_force is not None and set(row["forced"]) != expected_force:
         print(f"{case_id} activated {row['forced']}, expected {sorted(expected_force)}", flush=True)
         row["exit"] = 1
-    print(case_id, side, f"exit={check.returncode} win={row['won']} onlyDeath={row['OnlyDeathRoutesFound']}",
+    print(case_id, side, f"exit={row['exit']} win={row['won']} onlyDeath={row['OnlyDeathRoutesFound']}",
           f"boundary={row['Boundary']} HP={row['PlayerHp']} native={row['nativeOutcome']}:{row['nativeHp']}",
           f"firstMs={row['FirstWinMs']}", flush=True)
     return row
