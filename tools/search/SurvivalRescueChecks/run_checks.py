@@ -9,17 +9,24 @@ import time
 
 REPO = Path(__file__).resolve().parents[3]
 CORPUS = "coverage/corpora/novelty/"
+BOSS = CORPUS + "dev-09-necrobinder-boss.json"
+BOSS_FORCE = ["SHACKLING_POTION", "CURE_ALL"]
 FORCE = {"potionSlotCount": 2, "potions": {"ids": ["POWER_POTION", "COLORLESS_POTION"]}}
 BREW = {"potionSlotCount": 3, "potions": {"ids": [*FORCE["potions"]["ids"], "GAMBLERS_BREW"]}}
 REGRESSIONS = [
     ("02-dev-09-necrobinder-boss", CORPUS + "dev-09-necrobinder-boss.json", {}, "victory"),
     ("14-dev-09-necrobinder-boss-hp56", CORPUS + "dev-09-necrobinder-boss.json", {"playerCurrentHp": 56}, "victory"),
     ("15-holdout-04-necrobinder-hp25", CORPUS + "holdout-04-necrobinder.json", FORCE | {"playerCurrentHp": 25}, "forced-victory"),
-    ("15-holdout-04-necrobinder-hp28", CORPUS + "holdout-04-necrobinder.json", FORCE | {"playerCurrentHp": 28}, "incomplete"),
+    ("15-holdout-04-necrobinder-hp28", CORPUS + "holdout-04-necrobinder.json", FORCE | {"playerCurrentHp": 28}, "rescue"),
     ("lossless-defeat", None, {"characterId": "IRONCLAD", "encounterId": "FUZZY_WURM_CRAWLER_WEAK",
         "enemyCurrentHp": 30, "initialPlayerHp": 1, "initialPlayerEnergy": 0,
         "clearPlayerHand": True, "clearPlayerPiles": True}, "defeat"),
 ]
+BOSS_FORCE_CASES = [
+    (f"{case[0]}-force-{mode}", BOSS, case[2], "rescue")
+    for case in REGRESSIONS[:2] for mode in ("both", "0", "1")
+]
+REGRESSIONS += BOSS_FORCE_CASES
 CONTROLS = [
     ("00-sentinel-potions", CORPUS + "sentinel-potions.json", {}),
     ("01-GA-IRONCLAD-ELITE-00", "coverage/corpora/strategy/roots/GA-IRONCLAD-ELITE-00-spec.json", {}),
@@ -67,18 +74,35 @@ def run_case(args, case, side, dll):
         request.update(overrides)
     request_path = dest / "request.json"
     write(request_path, request)
+    settings_path = args.settings
+    expected_force = None
+    if case in BOSS_FORCE_CASES:
+        mode = case_id.rsplit("-", 1)[1]
+        settings = read(settings_path)
+        settings["potionDirectives"] = [
+            {"slot": slot, "potionId": potion, "directive": "Force"}
+            for slot, potion in enumerate(BOSS_FORCE) if mode in ("both", str(slot))
+        ]
+        settings_path = dest / "settings.json"
+        write(settings_path, settings)
+        expected_force = {f"{item['slot']}:{item['potionId']}" for item in settings["potionDirectives"]}
+    elif expectation == "rescue":
+        expected_force = {"0:POWER_POTION", "1:COLORLESS_POTION"}
     memory = memory_available()
     env = os.environ | {"OFFLINE_HARNESS_COMBATSOLVER_DLL": str(dll)}
     with (dest / "run.log").open("wb") as output:
         check = subprocess.run(
             [str(Path(env["DOTNET_ROOT"]) / "dotnet.exe"), str(args.harness),
-             str(request_path), str(args.settings), str(dest), expectation],
+             str(request_path), str(settings_path), str(dest), expectation],
             env=env, cwd=REPO, stdout=output, stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW, timeout=180)
     result_path = dest / "result.json"
     if not result_path.exists():
         raise RuntimeError(f"No result from {case_id}/{side}. Read {dest / 'run.log'}")
     row = read(result_path) | {"case": case_id, "side": side, "exit": check.returncode, "memory": memory}
+    if expected_force is not None and set(row["forced"]) != expected_force:
+        print(f"{case_id} activated {row['forced']}, expected {sorted(expected_force)}", flush=True)
+        row["exit"] = 1
     print(case_id, side, f"exit={check.returncode} win={row['won']} onlyDeath={row['OnlyDeathRoutesFound']}",
           f"boundary={row['Boundary']} HP={row['PlayerHp']} native={row['nativeOutcome']}:{row['nativeHp']}",
           f"firstMs={row['FirstWinMs']}", flush=True)

@@ -51,6 +51,8 @@ internal static class SurvivalRescueChecks
             var policy = SolverController.CaptureSearchPolicy(SolverSettings.Capture(), combat,
                 includeTurnSetup: false, theftPolicy: setup.Request.TheftPolicyForTest ?? SolverController.ResolveTheftPolicy(combat));
             double? firstWinMs = null;
+            using var process = Process.GetCurrentProcess();
+            TimeSpan cpuStart = process.TotalProcessorTime;
             var timer = Stopwatch.StartNew();
             void Observe(SolverResult result)
             {
@@ -61,13 +63,16 @@ internal static class SurvivalRescueChecks
                 onPreliminaryResult: Observe);
             Observe(result);
             timer.Stop();
+            process.Refresh();
+            double cpuMs = (process.TotalProcessorTime - cpuStart).TotalMilliseconds;
+            long peakWorkingSet = process.PeakWorkingSet64;
 
             var route = result.BestNode.Actions;
             byte[] routeJson = JsonSerializer.SerializeToUtf8Bytes(route, UnattendedTestFiles.JsonOptions);
             bool won = IsVictory(result);
             string? nativeOutcome = null;
             int? nativeHp = null;
-            if (expectation != "control" && (won || expectation is "incomplete" or "defeat"))
+            if (expectation != "control" && (won || expectation is "rescue" or "defeat"))
             {
                 Replay(combat, loop, route);
                 nativeOutcome = RealCombatDriver.GetLiveOutcome(combat).ToString();
@@ -80,7 +85,7 @@ internal static class SurvivalRescueChecks
             var used = route.Where(a => a.Kind == PlanActionKind.UsePotion)
                 .Select(a => $"{a.PotionSlot}:{a.PotionId}").ToArray();
             string? english = null, chinese = null;
-            if (expectation is "incomplete" or "defeat")
+            if (expectation is "rescue" or "defeat")
             {
                 english = SurvivalText(result, "eng");
                 chinese = SurvivalText(result, "zhs");
@@ -97,6 +102,10 @@ internal static class SurvivalRescueChecks
                 StartHp = root.HotRoot.RootState.Player.CurrentHp,
                 FirstWinMs = firstWinMs,
                 SolveMs = timer.Elapsed.TotalMilliseconds,
+                CpuMs = cpuMs,
+                PeakWorkingSetBytes = peakWorkingSet,
+                BudgetMs = settings.MaxCombatSolveSeconds * 1000,
+                ConfiguredNodeBudget = settings.SearchMaxExpandedNodes,
                 RouteSha = Convert.ToHexString(SHA256.HashData(routeJson)),
                 Root = root.ContinuationStamp.StateText,
                 forced, used, nativeOutcome, nativeHp, english, chinese,
@@ -109,16 +118,21 @@ internal static class SurvivalRescueChecks
             Console.WriteLine($"{setup.Request.ScenarioId}: victory={won} onlyDeath={result.OnlyDeathRoutesFound} "
                 + $"boundary={result.BoundaryReason} deathTurn={result.DeathTurn} native={nativeOutcome}:{nativeHp}");
 
+            bool validWin = won && !result.OnlyDeathRoutesFound && result.BoundaryReason == SearchBoundaryReason.None
+                && nativeOutcome == nameof(HotCombatOutcome.Victory) && nativeHp > 0 && nativeHp == result.Snapshot.PlayerHp
+                && forced.All(used.Contains);
+            bool hitConfiguredBudget = result.BoundaryReason == SearchBoundaryReason.TimeLimit
+                && timer.Elapsed.TotalMilliseconds >= record.BudgetMs
+                || result.BoundaryReason == SearchBoundaryReason.NodeLimit
+                && record.ConfiguredNodeBudget is int nodes && result.TotalExpandedNodes >= nodes;
             bool valid = expectation switch
             {
                 "control" => won,
-                "victory" or "forced-victory" => won && !result.OnlyDeathRoutesFound && result.BoundaryReason == SearchBoundaryReason.None
-                    && nativeOutcome == nameof(HotCombatOutcome.Victory) && nativeHp > 0 && nativeHp == result.Snapshot.PlayerHp
-                    && forced.All(used.Contains) && (expectation != "forced-victory"
-                        || forced.ToHashSet().SetEquals(["0:POWER_POTION", "1:COLORLESS_POTION"])),
-                "incomplete" => !won && !result.OnlyDeathRoutesFound && result.DeathTurn.HasValue
-                    && record.Boundary == "IncompleteSurvivalSearch" && nativeOutcome == nameof(HotCombatOutcome.Defeat)
-                    && chinese == "搜索未覆盖完整，暂无生还路线" && english == "Search incomplete. No surviving route found yet.",
+                "victory" => validWin,
+                "forced-victory" => validWin && forced.ToHashSet().SetEquals(["0:POWER_POTION", "1:COLORLESS_POTION"]),
+                "rescue" => validWin || (!won && hitConfiguredBudget && !result.OnlyDeathRoutesFound
+                    && result.DeathTurn.HasValue && nativeOutcome == nameof(HotCombatOutcome.Defeat)
+                    && chinese == "搜索未覆盖完整，暂无生还路线" && english == "Search incomplete. No surviving route found yet."),
                 "defeat" => !won && result.OnlyDeathRoutesFound && result.DeathTurn.HasValue
                     && result.BoundaryReason == SearchBoundaryReason.None && nativeOutcome == nameof(HotCombatOutcome.Defeat)
                     && chinese == "未找到生还路线" && english == "No surviving route found",
@@ -176,6 +190,8 @@ internal static class SurvivalRescueChecks
             using var scope = RunManager.Instance.CardSelectorStack.PushSelector(player, selector);
             var outcome = RealCombatDriver.RunRealCombatAction(loop, combat, liveAction,
                 externalErrorProbe: () => selector.LastError);
+            if (action.Kind == PlanActionKind.UsePotion && player.GetPotionAtSlotIndex(action.PotionSlot) != null)
+                throw new InvalidDataException($"Replay did not consume potion in slot {action.PotionSlot}.");
             Console.WriteLine($"{action.Turn}:{action.Kind}:{action.CardId}{action.PotionId}:"
                 + $"slot={action.PotionSlot} hp={player.Creature.CurrentHp} outcome={outcome}");
         }
