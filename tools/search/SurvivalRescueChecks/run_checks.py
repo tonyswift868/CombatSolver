@@ -36,6 +36,21 @@ REGRESSIONS += [
     (case_id, CORPUS + "holdout-04-necrobinder.json", FORCE | {"playerCurrentHp": 28}, "rescue")
     for case_id in BUDGET_CASES
 ]
+GAMBLER = {
+    "characterId": "IRONCLAD", "encounterId": "FUZZY_WURM_CRAWLER_WEAK",
+    "enemyCurrentHp": 30, "initialPlayerHp": 1, "initialPlayerEnergy": 0,
+    "clearPlayerHand": True, "clearPlayerPiles": True,
+    "cards": [{"cardId": card, "pile": pile} for pile, cards in (
+        ("Hand", "STRIKE_IRONCLAD POMMEL_STRIKE TWIN_STRIKE THUNDERCLAP SWORD_BOOMERANG BASH HEADBUTT"),
+        ("Draw", "STRIKE_IRONCLAD BASH POMMEL_STRIKE HEADBUTT DEFEND_IRONCLAD TWIN_STRIKE THUNDERCLAP"),
+    ) for card in cards.split()],
+    "potions": [{"potionId": "GAMBLERS_BREW"}],
+}
+REGRESSIONS += [
+    ("holdout-hp12", CORPUS + "holdout-04-necrobinder.json", FORCE | {"playerCurrentHp": 12}, "stress"),
+    ("gambler-6", None, GAMBLER, "gambler"),
+    ("explicit-default-cache", BOSS, {}, "cache"),
+]
 CONTROLS = [
     ("00-sentinel-potions", CORPUS + "sentinel-potions.json", {}),
     ("01-GA-IRONCLAD-ELITE-00", "coverage/corpora/strategy/roots/GA-IRONCLAD-ELITE-00-spec.json", {}),
@@ -86,7 +101,7 @@ def measure_child(command, env, dest):
     sample_process.argtypes = (ctypes.c_void_p, ctypes.POINTER(ProcessMemory), ctypes.c_ulong)
     with output_path.open("wb") as output, subprocess.Popen(
             command, env=env, cwd=REPO, stdout=output, stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW) as child:
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS) as child:
         deadline = time.monotonic() + 180
         while child.poll() is None:
             now = time.time_ns() // 1_000_000
@@ -153,6 +168,15 @@ def run_case(args, case, side, dll):
         expected_force = {f"{item['slot']}:{item['potionId']}" for item in settings["potionDirectives"]}
     elif expectation == "rescue":
         expected_force = {"0:POWER_POTION", "1:COLORLESS_POTION"}
+    if expectation == "cache":
+        settings = read(args.settings) | {
+            "potionDirectives": [{"slot": 0, "potionId": BOSS_FORCE[0], "directive": "Force"}],
+        }
+        write(dest / "unbounded.json", settings)
+        settings_path = dest / "settings.json"
+        write(settings_path, settings | {
+            "searchMaxExpandedNodes": 150_000, "searchBeamWidth": 96, "searchTimeLimitSeconds": 88,
+        })
     if case_id in BUDGET_CASES:
         settings_path = dest / "settings.json"
         write(settings_path, read(args.settings) | BUDGET_CASES[case_id])
@@ -162,6 +186,15 @@ def run_case(args, case, side, dll):
                str(request_path), str(settings_path), str(dest), expectation]
     code, samples = measure_child(command, env, dest)
     result_path = dest / "result.json"
+    if expectation == "cache":
+        print(case_id, f"exit={code}", (dest / "run.log").read_text(encoding="utf-8", errors="replace")
+              .splitlines()[-1], flush=True)
+        return {"case": case_id, "side": side, "exit": code}
+    if expectation == "gambler" and code == 1 and not result_path.exists():
+        log = (dest / "run.log").read_text(encoding="utf-8", errors="replace")
+        if "gambler: widened beam despite no beam truncation" in log:
+            print(case_id, "red: widened beam despite no beam truncation", flush=True)
+            return {"case": case_id, "side": side, "exit": 1}
     if not result_path.exists():
         raise RuntimeError(f"No result from {case_id}/{side}. Read {dest / 'run.log'}")
     row = read(result_path) | {

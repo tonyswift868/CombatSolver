@@ -52,6 +52,8 @@ internal static class SurvivalRescueChecks
                 includeTurnSetup: false, theftPolicy: setup.Request.TheftPolicyForTest ?? SolverController.ResolveTheftPolicy(combat));
             double? firstWinMs = null;
             List<string> rescueRounds = [];
+            using var cancel = new CancellationTokenSource();
+            bool redundantBeam = false;
             policy = policy with
             {
                 MeasurePhasePerformance = true,
@@ -59,6 +61,11 @@ internal static class SurvivalRescueChecks
                 {
                     if (!message.StartsWith("SURVIVAL_RESCUE ", StringComparison.Ordinal))
                         return;
+                    if (expectation == "gambler" && int.Parse(message.Split(' ')[1]["width=".Length..]) > 640)
+                    {
+                        redundantBeam = true;
+                        cancel.Cancel();
+                    }
                     rescueRounds.Add(message);
                     Console.WriteLine($"RESCUE_TICK {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()} {message}");
                 }, _ => { }),
@@ -71,21 +78,39 @@ internal static class SurvivalRescueChecks
                 if (IsVictory(result))
                     firstWinMs ??= timer.Elapsed.TotalMilliseconds;
             }
-            var result = HotSearchCoordinator.Solve(root, names, damage, policy, CancellationToken.None,
-                onPreliminaryResult: Observe);
+            SolverResult result;
+            try
+            {
+                result = HotSearchCoordinator.Solve(root, names, damage, policy, cancel.Token, onPreliminaryResult: Observe);
+            }
+            catch (OperationCanceledException) when (redundantBeam)
+            {
+                Console.Error.WriteLine("gambler: widened beam despite no beam truncation");
+                return 1;
+            }
             Observe(result);
             timer.Stop();
             Console.WriteLine($"RESCUE_END {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
             process.Refresh();
             double cpuMs = (process.TotalProcessorTime - cpuStart).TotalMilliseconds;
             long peakWorkingSet = process.PeakWorkingSet64;
+            if (expectation == "cache")
+                return CheckCache(result, root, names, damage, combat, loop, policy, output);
+            if (expectation == "stress")
+            {
+                var gc = GC.GetGCMemoryInfo();
+                Console.WriteLine($"RESCUE_MEMORY_RETURN ws={process.WorkingSet64} managed={GC.GetTotalMemory(false)} load={gc.MemoryLoadBytes} threshold={gc.HighMemoryLoadThresholdBytes}");
+                Thread.Sleep(TimeSpan.FromSeconds(10));
+                process.Refresh();
+                Console.WriteLine($"RESCUE_MEMORY_AFTER ws={process.WorkingSet64} managed={GC.GetTotalMemory(false)}");
+            }
 
             var route = result.BestNode.Actions;
             byte[] routeJson = JsonSerializer.SerializeToUtf8Bytes(route, UnattendedTestFiles.JsonOptions);
             bool won = IsVictory(result);
             string? nativeOutcome = null;
             int? nativeHp = null;
-            if (expectation != "control" && (won || expectation is "rescue" or "defeat"))
+            if (expectation != "control" && (won || expectation is "rescue" or "defeat" or "gambler" or "stress"))
             {
                 Replay(combat, loop, route);
                 nativeOutcome = RealCombatDriver.GetLiveOutcome(combat).ToString();
@@ -98,7 +123,7 @@ internal static class SurvivalRescueChecks
             var used = route.Where(a => a.Kind == PlanActionKind.UsePotion)
                 .Select(a => $"{a.PotionSlot}:{a.PotionId}").ToArray();
             string? english = null, chinese = null;
-            if (expectation is "rescue" or "defeat")
+            if (expectation is "rescue" or "defeat" or "gambler" or "stress")
             {
                 english = SurvivalText(result, "eng");
                 chinese = SurvivalText(result, "zhs");
@@ -148,6 +173,14 @@ internal static class SurvivalRescueChecks
                 "rescue" => validWin || (!won && hitConfiguredBudget && !result.OnlyDeathRoutesFound
                     && result.DeathTurn.HasValue && nativeOutcome == nameof(HotCombatOutcome.Defeat)
                     && chinese == "搜索未覆盖完整，暂无生还路线" && english == "Search incomplete. No surviving route found yet."),
+                "gambler" => timer.Elapsed.TotalSeconds < 3 && !redundantBeam
+                    && !won && nativeOutcome == nameof(HotCombatOutcome.Defeat)
+                    && ((!result.OnlyDeathRoutesFound && chinese == "搜索未覆盖完整，暂无生还路线")
+                        || (result.OnlyDeathRoutesFound && chinese == "未找到生还路线")),
+                "stress" => timer.Elapsed.TotalMilliseconds < record.BudgetMs + 2000
+                    && (validWin || (!won && !result.OnlyDeathRoutesFound
+                        && chinese == "搜索未覆盖完整，暂无生还路线" && forced.All(used.Contains)
+                        && result.DeathTurn.HasValue && nativeOutcome == nameof(HotCombatOutcome.Defeat))),
                 "defeat" => !won && result.OnlyDeathRoutesFound && result.DeathTurn.HasValue
                     && result.BoundaryReason == SearchBoundaryReason.None && nativeOutcome == nameof(HotCombatOutcome.Defeat)
                     && chinese == "未找到生还路线" && english == "No surviving route found",
@@ -163,6 +196,30 @@ internal static class SurvivalRescueChecks
             ModRuntime.Session?.Dispose();
             ModRuntime.FlushDiagnostics();
         }
+    }
+
+    private static int CheckCache(SolverResult capped, CombatRootSnapshot root, SolverDisplayNames names,
+        BattleDamageSnapshot damage, CombatState combat, MainLoopContext loop, SearchPolicySnapshot before, string output)
+    {
+        var settings = SolverSettings.DeserializeForTesting(File.ReadAllText(Path.Combine(output, "unbounded.json")));
+        SolverSettings.ApplyForTesting(settings with { OnlineStatisticsEnabled = false });
+        var after = SolverController.CaptureSearchPolicy(SolverSettings.Capture(), combat, false, before.TheftPolicy);
+        var previousPath = SolvedRouteCache.Capture(combat, root, before, damage).Path;
+        var nextPath = SolvedRouteCache.Capture(combat, root, after, damage).Path;
+        var old = new SolvedRouteCache(Path.Combine(output, Path.GetFileName(previousPath)));
+        var next = new SolvedRouteCache(Path.Combine(output, Path.GetFileName(nextPath)));
+        old.StoreFirst(capped);
+        var same = old.Read(root.Forecast);
+        var uncapped = next.Read(root.Forecast);
+        Console.WriteLine($"CACHE sameProfile={before.Profile == after.Profile} sameKey={previousPath == nextPath} "
+            + $"sameSettingsHit={same != null} releasedCapHit={uncapped != null} cappedWin={IsVictory(capped)}");
+        if (before.Profile != after.Profile || same == null || IsVictory(capped) || uncapped != null)
+            return 1;
+        var fresh = HotSearchCoordinator.Solve(root, names, damage, after, CancellationToken.None);
+        Replay(combat, loop, fresh.BestNode.Actions);
+        int hp = LocalContext.GetMe(combat)!.Creature.CurrentHp;
+        Console.WriteLine($"CACHE uncappedWin={IsVictory(fresh)} native={RealCombatDriver.GetLiveOutcome(combat)}:{hp}");
+        return IsVictory(fresh) && RealCombatDriver.GetLiveOutcome(combat) == HotCombatOutcome.Victory && hp > 0 ? 0 : 1;
     }
 
     private static bool IsVictory(SolverResult result)
