@@ -17,6 +17,7 @@ namespace CombatSolver;
 internal sealed class SolvedRouteCache
 {
     private const int MaximumEntries = 64;
+    private const int IdentityVersion = 2;
     private readonly Lazy<string> _path;
 
     internal SolvedRouteCache(string path)
@@ -37,8 +38,6 @@ internal sealed class SolvedRouteCache
         ModLoadState state,
         Guid[] Assemblies);
 
-    // Property names, casing, and declaration order must match the original anonymous
-    // cache-identity object exactly so persisted route cache filenames remain compatible.
     private sealed record CacheIdentityPayload(
         int Schema,
         Guid Solver,
@@ -73,12 +72,19 @@ internal sealed class SolvedRouteCache
         bool PredictPotionReward,
         int TranspositionPruningDisabledMask,
         bool FixedBudget,
-        int? BudgetOverrideMilliseconds);
+        int? BudgetOverrideMilliseconds,
+        int? ExplicitSearchMaxExpandedNodes,
+        double MaxCombatSolveSeconds,
+        bool AdaptiveEscalationEnabled,
+        bool EnableTurnBoundaryRollouts,
+        int TranspositionEntryLimit,
+        int MaxDegreeOfParallelism,
+        bool DetailedDiagnostics);
 
     internal static void WarmUpSerializer()
     {
         CacheIdentityPayload dummy = new(
-            Schema: 1,
+            Schema: IdentityVersion,
             Solver: typeof(SolvedRouteCache).Module.ModuleVersionId,
             Game: typeof(CombatState).Module.ModuleVersionId,
             Mods: Array.Empty<ModIdentity>(),
@@ -111,7 +117,14 @@ internal sealed class SolvedRouteCache
             PredictPotionReward: false,
             TranspositionPruningDisabledMask: 0,
             FixedBudget: false,
-            BudgetOverrideMilliseconds: null);
+            BudgetOverrideMilliseconds: null,
+            ExplicitSearchMaxExpandedNodes: null,
+            MaxCombatSolveSeconds: SearchPolicySnapshot.DefaultMaxCombatSolveSeconds,
+            AdaptiveEscalationEnabled: true,
+            EnableTurnBoundaryRollouts: true,
+            TranspositionEntryLimit: SearchPolicySnapshot.DefaultTranspositionEntryLimit,
+            MaxDegreeOfParallelism: SolverWeights.DefaultSearchMaxDegreeOfParallelism,
+            DetailedDiagnostics: false);
         byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(dummy);
         _ = SHA256.HashData(bytes);
     }
@@ -134,9 +147,10 @@ internal sealed class SolvedRouteCache
 
         // Freeze all live-state and Godot-API fields on the main thread, then defer
         // JSON serialization + SHA256 hashing until Path is first read on the worker thread.
-        string cacheDirectory = ProjectSettings.GlobalizePath("user://combat-solver-routes");
+        string cacheDirectory = System.IO.Path.Combine(
+            ProjectSettings.GlobalizePath("user://combat-solver-routes"), $"v{IdentityVersion}");
         CacheIdentityPayload payload = new(
-            Schema: 1,
+            Schema: IdentityVersion,
             Solver: typeof(SolvedRouteCache).Module.ModuleVersionId,
             Game: typeof(CombatState).Module.ModuleVersionId,
             Mods: ModManager.Mods.Select(mod => new ModIdentity(
@@ -173,7 +187,14 @@ internal sealed class SolvedRouteCache
             PredictPotionReward: policy.PredictPotionReward,
             TranspositionPruningDisabledMask: policy.TranspositionPruningDisabledMask,
             FixedBudget: policy.FixedBudget,
-            BudgetOverrideMilliseconds: policy.BudgetOverrideMilliseconds);
+            BudgetOverrideMilliseconds: policy.BudgetOverrideMilliseconds,
+            ExplicitSearchMaxExpandedNodes: policy.ExplicitSearchMaxExpandedNodes,
+            MaxCombatSolveSeconds: policy.MaxCombatSolveSeconds,
+            AdaptiveEscalationEnabled: policy.AdaptiveEscalationEnabled,
+            EnableTurnBoundaryRollouts: policy.EnableTurnBoundaryRollouts,
+            TranspositionEntryLimit: policy.TranspositionEntryLimit,
+            MaxDegreeOfParallelism: policy.MaxDegreeOfParallelism,
+            DetailedDiagnostics: policy.DetailedDiagnostics);
 
         return new SolvedRouteCache(() =>
         {

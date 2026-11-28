@@ -182,6 +182,8 @@ def run_case(args, case, side, dll):
         write(settings_path, read(args.settings) | BUDGET_CASES[case_id])
     memory = memory_available()
     env = os.environ | {"OFFLINE_HARNESS_COMBATSOLVER_DLL": str(dll)}
+    if expectation == "stress":
+        env["DOTNET_gcServer"] = "1"
     command = [str(Path(env["DOTNET_ROOT"]) / "dotnet.exe"), str(args.harness),
                str(request_path), str(settings_path), str(dest), expectation]
     code, samples = measure_child(command, env, dest)
@@ -203,10 +205,19 @@ def run_case(args, case, side, dll):
         "minHostPhysicalMiB": min((point[1] for point in samples), default=None),
         "minHostCommitMiB": min((point[2] for point in samples), default=None),
     }
-    write(dest / "measurement.json", row)
+    if expectation == "stress":
+        log = (dest / "run.log").read_text(encoding="utf-8", errors="replace")
+        decision = re.search(r"SURVIVAL_STOP reason=memory projectedGrowth=(\d+) headroom=(-?\d+)", log)
+        if row["BudgetMs"] != 88_000 or row["Dop"] != 16 or not row["ServerGC"]:
+            row["exit"] = 1
+        if decision and int(decision[1]) <= int(decision[2]):
+            row["exit"] = 1
+        if row["minHostPhysicalMiB"] < 2048 or row["minHostCommitMiB"] < 2048:
+            row["exit"] = 1
     if expected_force is not None and set(row["forced"]) != expected_force:
         print(f"{case_id} activated {row['forced']}, expected {sorted(expected_force)}", flush=True)
         row["exit"] = 1
+    write(dest / "measurement.json", row)
     print(case_id, side, f"exit={row['exit']} win={row['won']} onlyDeath={row['OnlyDeathRoutesFound']}",
           f"boundary={row['Boundary']} HP={row['PlayerHp']} native={row['nativeOutcome']}:{row['nativeHp']}",
           f"firstMs={row['FirstWinMs']}", flush=True)

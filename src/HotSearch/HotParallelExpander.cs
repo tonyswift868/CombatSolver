@@ -83,6 +83,7 @@ internal sealed class HotExpansionWorkspace : IDisposable
 {
     private const int InitialStagedChildCapacity = 1024;
     private const int InitialStagedChoiceCapacity = 512;
+    internal const int MaximumChoiceBranches = 64;
     internal const int ChoiceLayerCapacity = 256;
     internal const int ChoiceResolvedCapacity = 160;
     internal const int TurnSetupChoiceLayerCapacity = 512;
@@ -126,7 +127,14 @@ internal sealed class HotExpansionWorkspace : IDisposable
     public int WaveEndTurnPrefixReuses;
     public int WaveCapacityExceededDrops;
     public int WaveBranchTruncations;
+    public HotSearchTruncation WaveTruncations;
     public long WaveAllocatedBytes;
+
+    public void RecordTruncation(HotSearchTruncation reason)
+    {
+        WaveBranchTruncations++;
+        WaveTruncations |= reason;
+    }
 
     public void ResetWave()
     {
@@ -145,6 +153,7 @@ internal sealed class HotExpansionWorkspace : IDisposable
         WaveEndTurnPrefixReuses = 0;
         WaveCapacityExceededDrops = 0;
         WaveBranchTruncations = 0;
+        WaveTruncations = HotSearchTruncation.None;
         WaveAllocatedBytes = 0;
         StagingArena.Reset();
     }
@@ -228,6 +237,7 @@ internal struct HotWaveStats
     public int StandPatProbes;
     public int CapacityExceededDrops;
     public int BranchTruncations;
+    public HotSearchTruncation Truncations;
     public int ParallelWaves;
     public int ParallelWorkItems;
     public int MaxConcurrency;
@@ -430,6 +440,7 @@ internal sealed class HotParallelExpander : IDisposable
             stats.EndTurnPrefixReuses += ws.WaveEndTurnPrefixReuses;
             stats.CapacityExceededDrops += ws.WaveCapacityExceededDrops;
             stats.BranchTruncations += ws.WaveBranchTruncations;
+            stats.Truncations |= ws.WaveTruncations;
             stats.WorkerAllocatedBytes += ws.WaveAllocatedBytes;
         }
 
@@ -1120,7 +1131,7 @@ internal sealed class HotParallelExpander : IDisposable
                 config.MaxCardBranchesPerNode,
                 keepPlayCardAction);
             if (filterPlayCards)
-                ws.WaveBranchTruncations++;
+                ws.RecordTruncation(HotSearchTruncation.Other);
         }
 
         int cardBranchesEmitted = 0;
@@ -1208,7 +1219,7 @@ internal sealed class HotParallelExpander : IDisposable
                 }
                 else if (config.MaxCardBranchesPerNode > 0 && cardBranchesEmitted >= config.MaxCardBranchesPerNode)
                 {
-                    ws.WaveBranchTruncations++;
+                    ws.RecordTruncation(HotSearchTruncation.Other);
                     continue;
                 }
 
@@ -2002,7 +2013,7 @@ internal sealed class HotParallelExpander : IDisposable
                 out screenedCount,
                 ref resolvedCount);
             if (hasScreenedFilter)
-                ws.WaveBranchTruncations++;
+                ws.RecordTruncation(HotSearchTruncation.Other);
         }
 
         // Canonical UID sort at depth 0 for unordered groups ensures clean deterministic expansion.
@@ -2025,7 +2036,7 @@ internal sealed class HotParallelExpander : IDisposable
 
         int depth0Limit = Math.Min(optCount, layerCap - currCount);
         if (depth0Limit < optCount)
-            ws.WaveBranchTruncations++;
+            ws.RecordTruncation(HotSearchTruncation.Other);
         for (int i = 0; i < depth0Limit; i++)
         {
             HotChoiceSelection opt = ws.ChoiceOptBuf[i];
@@ -2186,7 +2197,7 @@ internal sealed class HotParallelExpander : IDisposable
         }
 
         if (choiceTreeTruncated || (currCount > 0 && resolvedCount >= resolvedCap))
-            ws.WaveBranchTruncations++;
+            ws.RecordTruncation(HotSearchTruncation.Other);
 
         if (resolvedCount <= 0)
             return;
@@ -2855,7 +2866,13 @@ internal sealed class HotParallelExpander : IDisposable
         int cap = Math.Min(resolvedCount, effectiveMaxBranches);
         bool needsPruning = resolvedCount > cap;
         if (needsPruning)
-            ws.WaveBranchTruncations++;
+        {
+            HotSearchTruncation reason = action.Kind == HotActionKind.TurnSetup
+                || maxBranches >= HotExpansionWorkspace.MaximumChoiceBranches
+                ? HotSearchTruncation.Other
+                : firstKind == HotChoiceKind.HandCard ? HotSearchTruncation.HandChoices : HotSearchTruncation.PileChoices;
+            ws.RecordTruncation(reason);
+        }
 
         bool isDelayedPileChoice = firstKind is HotChoiceKind.DrawPile or HotChoiceKind.DiscardPile or HotChoiceKind.ExhaustPile;
 
@@ -3551,7 +3568,7 @@ internal sealed class HotParallelExpander : IDisposable
             int setupCap = raw > 0 ? raw : 64;
             return Math.Clamp(Math.Max(setupCap, 64), 64, HotExpansionWorkspace.TurnSetupChoiceResolvedCapacity);
         }
-        return Math.Clamp(raw > 0 ? raw : 18, 1, 64);
+        return Math.Clamp(raw > 0 ? raw : 18, 1, HotExpansionWorkspace.MaximumChoiceBranches);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

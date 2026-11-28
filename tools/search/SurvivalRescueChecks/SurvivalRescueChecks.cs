@@ -60,7 +60,11 @@ internal static class SurvivalRescueChecks
                 Diagnostics = new SearchDiagnosticsSink(message =>
                 {
                     if (!message.StartsWith("SURVIVAL_RESCUE ", StringComparison.Ordinal))
+                    {
+                        if (message.StartsWith("SURVIVAL_", StringComparison.Ordinal))
+                            Console.WriteLine(message);
                         return;
+                    }
                     if (expectation == "gambler" && int.Parse(message.Split(' ')[1]["width=".Length..]) > 640)
                     {
                         redundantBeam = true;
@@ -206,14 +210,22 @@ internal static class SurvivalRescueChecks
         var after = SolverController.CaptureSearchPolicy(SolverSettings.Capture(), combat, false, before.TheftPolicy);
         var previousPath = SolvedRouteCache.Capture(combat, root, before, damage).Path;
         var nextPath = SolvedRouteCache.Capture(combat, root, after, damage).Path;
-        var old = new SolvedRouteCache(Path.Combine(output, Path.GetFileName(previousPath)));
-        var next = new SolvedRouteCache(Path.Combine(output, Path.GetFileName(nextPath)));
+        string outputCache = Path.Combine(output, "cache");
+        string cacheDirectory = Path.GetFileName(Path.GetDirectoryName(nextPath)!);
+        var old = new SolvedRouteCache(Path.Combine(outputCache, cacheDirectory, Path.GetFileName(previousPath)));
+        var next = new SolvedRouteCache(Path.Combine(outputCache, cacheDirectory, Path.GetFileName(nextPath)));
+        var legacy = new SolvedRouteCache(Path.Combine(outputCache, Path.GetFileName(nextPath)));
+        legacy.StoreFirst(capped);
+        byte[] legacyBytes = File.ReadAllBytes(legacy.Path);
         old.StoreFirst(capped);
         var same = old.Read(root.Forecast);
         var uncapped = next.Read(root.Forecast);
         Console.WriteLine($"CACHE sameProfile={before.Profile == after.Profile} sameKey={previousPath == nextPath} "
             + $"sameSettingsHit={same != null} releasedCapHit={uncapped != null} cappedWin={IsVictory(capped)}");
-        if (before.Profile != after.Profile || same == null || IsVictory(capped) || uncapped != null)
+        bool legacyUntouched = legacyBytes.AsSpan().SequenceEqual(File.ReadAllBytes(legacy.Path));
+        Console.WriteLine($"CACHE policyNamespace={cacheDirectory} legacyUntouched={legacyUntouched}");
+        if (before.Profile != after.Profile || same == null || IsVictory(capped) || uncapped != null
+            || cacheDirectory != "v2" || !legacyUntouched)
             return 1;
         var fresh = HotSearchCoordinator.Solve(root, names, damage, after, CancellationToken.None);
         Replay(combat, loop, fresh.BestNode.Actions);
