@@ -114,7 +114,7 @@ internal static class SurvivalRescueChecks
             bool won = IsVictory(result);
             string? nativeOutcome = null;
             int? nativeHp = null;
-            if (expectation != "control" && (won || expectation is "rescue" or "defeat" or "gambler" or "stress"))
+            if (expectation != "control" && (won || expectation is "rescue" or "defeat" or "gambler" or "stress" or "pressure"))
             {
                 Replay(combat, loop, route);
                 nativeOutcome = RealCombatDriver.GetLiveOutcome(combat).ToString();
@@ -127,7 +127,7 @@ internal static class SurvivalRescueChecks
             var used = route.Where(a => a.Kind == PlanActionKind.UsePotion)
                 .Select(a => $"{a.PotionSlot}:{a.PotionId}").ToArray();
             string? english = null, chinese = null;
-            if (expectation is "rescue" or "defeat" or "gambler" or "stress")
+            if (expectation is "rescue" or "defeat" or "gambler" or "stress" or "pressure")
             {
                 english = SurvivalText(result, "eng");
                 chinese = SurvivalText(result, "zhs");
@@ -181,7 +181,7 @@ internal static class SurvivalRescueChecks
                     && !won && nativeOutcome == nameof(HotCombatOutcome.Defeat)
                     && ((!result.OnlyDeathRoutesFound && chinese == "搜索未覆盖完整，暂无生还路线")
                         || (result.OnlyDeathRoutesFound && chinese == "未找到生还路线")),
-                "stress" => timer.Elapsed.TotalMilliseconds < record.BudgetMs + 2000
+                "stress" or "pressure" => timer.Elapsed.TotalMilliseconds < record.BudgetMs + 2000
                     && (validWin || (!won && !result.OnlyDeathRoutesFound
                         && chinese == "搜索未覆盖完整，暂无生还路线" && forced.All(used.Contains)
                         && result.DeathTurn.HasValue && nativeOutcome == nameof(HotCombatOutcome.Defeat))),

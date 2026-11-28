@@ -51,6 +51,19 @@ REGRESSIONS += [
     ("gambler-6", None, GAMBLER, "gambler"),
     ("explicit-default-cache", BOSS, {}, "cache"),
 ]
+PRESSURE_CASES = {
+    "holdout-hp12-pressure": {},
+    "holdout-hp12-pressure-pile64": {"searchMaxPileChoiceBranchesPerAction": 64},
+}
+REGRESSIONS += [
+    (name, CORPUS + "holdout-04-necrobinder.json", FORCE | {"playerCurrentHp": 12}, "pressure")
+    for name in PRESSURE_CASES
+]
+PREVIOUS_HP = {
+    "02-dev-09-necrobinder-boss": 66,
+    "02-dev-09-necrobinder-boss-force-0": 66,
+    "14-dev-09-necrobinder-boss-hp56-force-both": 20,
+}
 CONTROLS = [
     ("00-sentinel-potions", CORPUS + "sentinel-potions.json", {}),
     ("01-GA-IRONCLAD-ELITE-00", "coverage/corpora/strategy/roots/GA-IRONCLAD-ELITE-00-spec.json", {}),
@@ -177,13 +190,16 @@ def run_case(args, case, side, dll):
         write(settings_path, settings | {
             "searchMaxExpandedNodes": 150_000, "searchBeamWidth": 96, "searchTimeLimitSeconds": 88,
         })
-    if case_id in BUDGET_CASES:
+    if case_id in BUDGET_CASES or case_id in PRESSURE_CASES:
         settings_path = dest / "settings.json"
-        write(settings_path, read(args.settings) | BUDGET_CASES[case_id])
+        write(settings_path, read(args.settings) | (BUDGET_CASES | PRESSURE_CASES)[case_id])
     memory = memory_available()
     env = os.environ | {"OFFLINE_HARNESS_COMBATSOLVER_DLL": str(dll)}
-    if expectation == "stress":
+    if expectation in ("stress", "pressure"):
         env["DOTNET_gcServer"] = "1"
+    if expectation == "pressure":
+        env["DOTNET_GCHighMemPercent"] = "20"
+        expected_force = {"0:POWER_POTION", "1:COLORLESS_POTION"}
     command = [str(Path(env["DOTNET_ROOT"]) / "dotnet.exe"), str(args.harness),
                str(request_path), str(settings_path), str(dest), expectation]
     code, samples = measure_child(command, env, dest)
@@ -214,6 +230,26 @@ def run_case(args, case, side, dll):
             row["exit"] = 1
         if row["minHostPhysicalMiB"] < 2048 or row["minHostCommitMiB"] < 2048:
             row["exit"] = 1
+    if expectation == "pressure":
+        log = (dest / "run.log").read_text(encoding="utf-8", errors="replace")
+        stop = re.search(r"SURVIVAL_STOP reason=memory projectedGrowth=(\d+) headroom=-?\d+ load=(\d+) threshold=(\d+)", log)
+        rounds = {(item["width"], item["mode"]) for item in row["roundMemory"]}
+        ordinary_pile_cap = not PRESSURE_CASES[case_id]
+        expected_setup = not ordinary_pile_cap
+        row["simulatedPressureVerified"] = bool(stop and int(stop[2]) > int(stop[3]) > 0)
+        row["baselineRoundRan"] = (640, "Balanced") in rounds
+        row["oversizeRoundRan"] = any(width > 640 for width, _ in rounds)
+        row["setupRoundRan"] = (640, "SetupAndSurvival") in rounds
+        if not (row["simulatedPressureVerified"] and row["baselineRoundRan"]
+                and not row["oversizeRoundRan"] and row["setupRoundRan"] == expected_setup
+                and (int(stop[1]) > 0) == expected_setup):
+            row["exit"] = 1
+    if case_id in PREVIOUS_HP:
+        row["previousHpTarget"] = PREVIOUS_HP[case_id]
+        row["previousHpMet"] = row["won"] and row["nativeHp"] >= row["previousHpTarget"]
+        print(f"{case_id}: native HP {row['nativeHp']}, previous HP target {row['previousHpTarget']}", flush=True)
+        if args.require_previous_hp and not row["previousHpMet"]:
+            row["exit"] = 1
     if expected_force is not None and set(row["forced"]) != expected_force:
         print(f"{case_id} activated {row['forced']}, expected {sorted(expected_force)}", flush=True)
         row["exit"] = 1
@@ -228,6 +264,8 @@ def main():
     for option in ("harness", "settings", "output", "candidate", "baseline"):
         parser.add_argument(f"--{option}", type=lambda path: Path(path).resolve(), required=option != "baseline")
     parser.add_argument("--case", action="append")
+    parser.add_argument("--require-previous-hp", action="store_true",
+                        help="Also fail when a win has less HP than the measured pre-refactor route.")
     args = parser.parse_args()
     rows = []
     snapshots = ("Root", "RouteSha", "TotalExpandedNodes", "TotalTransitionCount", "PlayerHp")
