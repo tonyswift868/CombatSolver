@@ -1005,7 +1005,10 @@ internal static class HotSearchCoordinator
                 (HotSearchTruncation Truncations, long Demand) SearchForSurvival(int width, HotEvalMode mode,
                     bool allowDeathSaveRescue, SolverSearchProfile profile)
                 {
-                    if (!HasRoomForSurvival(0))
+                    bool exceedsNormalScale = width > HotSearchConstants.MaxBeamWidth
+                        || profile.MaxHandChoiceBranchesPerAction > policy.Profile.MaxHandChoiceBranchesPerAction
+                        || profile.MaxPileChoiceBranchesPerAction > policy.Profile.MaxPileChoiceBranchesPerAction;
+                    if (exceedsNormalScale && !HasRoomForSurvival(0))
                         return default;
                     long before = GC.GetTotalMemory(false);
                     long beforeCommitted = GC.GetGCMemoryInfo().TotalCommittedBytes;
@@ -1049,7 +1052,11 @@ internal static class HotSearchCoordinator
 
                 int width = HotSearchConstants.MaxBeamWidth;
                 SolverSearchProfile balanced = policy.Profile;
-                SolverSearchProfile setup = balanced;
+                SolverSearchProfile setup = balanced with
+                {
+                    MaxPileChoiceBranchesPerAction = Math.Max(
+                        balanced.MaxPileChoiceBranchesPerAction, HotExpansionWorkspace.MaximumChoiceBranches),
+                };
                 while (CanSearchForSurvival())
                 {
                     var b = SearchForSurvival(width, HotEvalMode.Balanced, allowDeathSaveRescue: true, balanced);
