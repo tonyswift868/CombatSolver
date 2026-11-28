@@ -63,6 +63,7 @@ internal sealed class HotBeamRetention : IDisposable
     /// Pareto domination so defeat-rescue passes can preserve death-save survival trajectories.
     /// </summary>
     public bool AllowDeathSaveRescue { get; set; }
+    public bool RaiseForcedZeroPotionReserve { get; set; }
 
     public HotBeamRetention(int initialCapacity = 4096)
     {
@@ -184,6 +185,7 @@ internal sealed class HotBeamRetention : IDisposable
             RelaxZeroPotionReserve,
             MinZeroPotionReservePercent,
             hasForcedDirectives: policy.ForcedDirectiveCount > 0,
+            RaiseForcedZeroPotionReserve,
             turnLayer,
             bucketQuotas);
 
@@ -253,6 +255,7 @@ internal sealed class HotBeamRetention : IDisposable
         bool relaxZeroPotionReserve,
         int minZeroPotionReservePercent,
         bool hasForcedDirectives,
+        bool raiseForcedZeroPotionReserve,
         int turnLayer,
         Span<int> quotas)
     {
@@ -286,9 +289,14 @@ internal sealed class HotBeamRetention : IDisposable
             bool enforceCeilFloor = false;
             if (hasForcedDirectives)
             {
-                zeroPct = !preferPotionBuckets
-                    ? (turnLayer <= 1 ? 25 : 15)
-                    : (turnLayer <= 1 ? 20 : 12);
+                if (raiseForcedZeroPotionReserve)
+                    zeroPct = !preferPotionBuckets
+                        ? (turnLayer <= 1 ? 45 : 30)
+                        : (turnLayer <= 1 ? 40 : 25);
+                else
+                    zeroPct = !preferPotionBuckets
+                        ? (turnLayer <= 1 ? 25 : 15)
+                        : (turnLayer <= 1 ? 20 : 12);
             }
             else if (!preferPotionBuckets)
             {

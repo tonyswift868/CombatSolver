@@ -1213,7 +1213,11 @@ internal static class SolverOverlay
                 };
         }
         if (_deathOutcomeLabel != null)
-            _deathOutcomeLabel.Visible = snapshot.OnlyDeathRoutesFound;
+        {
+            string? outcome = snapshot.SurvivalOutcomeText;
+            _deathOutcomeLabel.Visible = outcome != null;
+            _deathOutcomeLabel.Text = outcome ?? string.Empty;
+        }
         for (int index = 0; index < SolverWeights.UiTurnRows; index++)
         {
             if (index >= snapshot.Turns.Count)

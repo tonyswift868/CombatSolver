@@ -75,6 +75,10 @@ internal sealed record SolverOverlaySnapshot(
     string? SearchLimitWarningText)
 {
     public string? UnrecoveredLootText { get; init; }
+    public bool SurvivalSearchIncomplete { get; init; }
+    public string? SurvivalOutcomeText => SurvivalSearchIncomplete
+        ? SolverText.Get("搜索未覆盖完整，暂无生还路线")
+        : OnlyDeathRoutesFound ? SolverText.Get("未找到生还路线") : null;
     internal static (int ProjectedLoss, int TotalRecovered) BattleHpTotalsForDisplay(
         int lostSoFar, int recoveredSoFar,
         IReadOnlyDictionary<int, int> lossByTurn,
@@ -318,6 +322,8 @@ internal sealed record SolverOverlaySnapshot(
         {
             PendingTurnSetup = pendingTurnSetup,
             IsPreliminary = result.IsPreliminary,
+            SurvivalSearchIncomplete = result.BoundaryReason == SearchBoundaryReason.IncompleteSurvivalSearch
+                || (!isEventDefeat && !result.OnlyDeathRoutesFound && result.DeathTurn.HasValue),
             RewardOutcomeText = RewardOutcome(result),
             UsedPotionOutcomeText = UsedPotionOutcome(result),
             PlannedPotionOutcomeText = PlannedPotionOutcome(result),
@@ -676,6 +682,7 @@ internal sealed record SolverOverlaySnapshot(
         SearchBoundaryReason.NodeLimit => SolverText.Get("节点上限"),
         SearchBoundaryReason.TurnLimit => SolverText.Get("回合上限"),
         SearchBoundaryReason.TimeLimit => SolverText.Get("时间预算"),
+        SearchBoundaryReason.IncompleteSurvivalSearch => SolverText.Get("搜索未覆盖完整，暂无生还路线"),
         _ => SolverText.Get("搜索完成"),
     };
 

@@ -53,7 +53,8 @@ internal readonly record struct HotPassOutcome(
     int Gen1,
     int Gen2,
     TimeSpan GcPause,
-    bool WasLosslesslyExhausted = false);
+    bool WasLosslesslyExhausted,
+    bool ExhaustedAllowedPotionSearch);
 
 /// <summary>
 /// Unified Hot-Kernel search coordinator built on ONE coherent economic objective
@@ -371,6 +372,7 @@ internal static class HotSearchCoordinator
             bool stage1PhaseBTimedOut = false;
             bool stage1PhaseACompletedCleanly = false;
             bool stage1PhaseALosslesslyExhausted = false;
+            bool exhaustedAllowedPotionSearch = false;
 
             void EnsureBestMaterializedBeforeReset()
             {
@@ -393,7 +395,8 @@ internal static class HotSearchCoordinator
                 string mainPhaseLabel,
                 string potionPhaseLabel,
                 HotSearchBudget stageBudget,
-                bool allowDeathSaveRescue)
+                bool allowDeathSaveRescue,
+                SolverSearchProfile? profileOverride = null)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (stageNumber > 1 && (stageBudget.IsTimeExpired || totalExpanded >= stageNodeCeiling))
@@ -493,7 +496,7 @@ internal static class HotSearchCoordinator
                         in hotPolicy,
                         in evalLookup,
                         rootPotionCosts,
-                        policy.Profile,
+                        profileOverride ?? policy.Profile,
                         phaseABudget,
                         nodeArena,
                         ref mainStateArena,
@@ -530,6 +533,7 @@ internal static class HotSearchCoordinator
                     }
 
                     phaseAWasLosslesslyExhausted = phaseA.WasLosslesslyExhausted;
+                    exhaustedAllowedPotionSearch |= phaseA.ExhaustedAllowedPotionSearch;
                     phaseABoundaryReason = phaseA.BoundaryReason;
 
                     HotRouteKey phaseAKey = phaseA.BestKey;
@@ -661,7 +665,7 @@ internal static class HotSearchCoordinator
                     in hotPolicy,
                     in evalLookup,
                     rootPotionCosts,
-                    policy.Profile,
+                    profileOverride ?? policy.Profile,
                     phaseBBudget,
                     nodeArena,
                     ref mainStateArena,
@@ -694,6 +698,7 @@ internal static class HotSearchCoordinator
                 AccumulatePassTotals(phaseB,
                     ref totalExpanded, ref totalTransitions, ref totalChoices, ref totalAllocated,
                     ref totalGen0, ref totalGen1, ref totalGen2, ref totalGcPause, ref passCount, ref totalRolloutStats);
+                exhaustedAllowedPotionSearch |= phaseB.ExhaustedAllowedPotionSearch;
 
                 if (stageNumber == 1 && phaseB.BoundaryReason == SearchBoundaryReason.TimeLimit)
                     stage1PhaseBTimedOut = true;
@@ -954,6 +959,47 @@ internal static class HotSearchCoordinator
                 }
             }
 
+            bool CanSearchForSurvival() => !bestPass.HasVictory && !exhaustedAllowedPotionSearch
+                && totalExpanded < fullBudget.MaxExpandedNodes && fullBudget.RemainingMilliseconds >= 400;
+
+            void SearchForSurvival(int width, HotEvalMode mode, bool allowDeathSaveRescue,
+                SolverSearchProfile? profileOverride = null)
+            {
+                RunAdaptiveStage(
+                    stageNumber: 3,
+                    stageWidth: width,
+                    stageNodeCeiling: fullBudget.MaxExpandedNodes,
+                    rolloutHorizonTurns: Stage3RolloutHorizon,
+                    stageEvalMode: mode,
+                    mainPhaseLabel: "正在深度搜索路线",
+                    potionPhaseLabel: "正在深度评估药水路线",
+                    stageBudget: fullBudget,
+                    allowDeathSaveRescue: allowDeathSaveRescue,
+                    profileOverride: profileOverride);
+            }
+
+            bool ranSurvivalSearch = CanSearchForSurvival();
+            if (ranSurvivalSearch)
+            {
+                if (allowForcedPotions)
+                {
+                    retention.RaiseForcedZeroPotionReserve = true;
+                    SearchForSurvival(stage3Width, HotEvalMode.Offense, allowDeathSaveRescue: true);
+                }
+                else
+                {
+                    SearchForSurvival(HotSearchConstants.MaxBeamWidth, HotEvalMode.Balanced, allowDeathSaveRescue: true);
+                    if (CanSearchForSurvival())
+                    {
+                        SearchForSurvival(HotSearchConstants.MaxBeamWidth, HotEvalMode.SetupAndSurvival,
+                            allowDeathSaveRescue: false, profileOverride: policy.Profile with
+                            {
+                                MaxPileChoiceBranchesPerAction = Math.Max(64, policy.Profile.MaxPileChoiceBranchesPerAction),
+                            });
+                    }
+                }
+            }
+
             ValidateHardPotionConstraints(in bestPassKey, bestPass.HasBest, in hotPolicy, policy.PotionStrategy);
 
             bool reachedGlobalStopTarget = hasBestPass
@@ -962,7 +1008,8 @@ internal static class HotSearchCoordinator
                 && (!smartMode
                     || !HotPotionPolicy.CanAnyPaidPotionImproveOn(
                         in bestPassKey, in hotPolicy, rootPotionCosts, in rootState, rootBundle.Rules));
-            int effectiveFinalNodeCeiling = bestPass.HasVictory ? stage3NodeCeiling : maxTotalNodes;
+            int effectiveFinalNodeCeiling = bestPass.HasVictory && !ranSurvivalSearch
+                ? stage3NodeCeiling : fullBudget.MaxExpandedNodes;
             SearchBoundaryReason finalBoundaryReason = ResolveEffectiveBoundaryReason(
                 in bestPass,
                 postBestBoundary,
@@ -2014,10 +2061,13 @@ internal static class HotSearchCoordinator
             && !capacityBounded
             && boundaryReason == SearchBoundaryReason.None
             && stats.BranchTruncations == 0;
+        bool exhaustedAllowedPotionSearch = wasLosslesslyExhausted
+            && (allowPaidOptionalPotions || hotPolicy.PaidOptionalPotionCount == 0
+                || hotPolicy.EffectivePotionPolicy == SolverPotionPolicy.Disabled);
         if (capacityBounded && !hasVictory && boundaryReason == SearchBoundaryReason.None)
             boundaryReason = SearchBoundaryReason.DynamicResolution;
 
-        bool frontierExhaustedInDefeat = !hasVictory
+        bool retainedFrontierEndedInDefeat = !hasVictory
             && !capacityBounded
             && boundaryReason == SearchBoundaryReason.None
             && !lastTurnHitPerTurnNodeCap
@@ -2049,17 +2099,14 @@ internal static class HotSearchCoordinator
             onlyDeathRoutes = false;
             isMidTurnFallback = false;
         }
-        else if (frontierExhaustedInDefeat)
+        else if (retainedFrontierEndedInDefeat)
         {
-            // Every explored branch in the search tree ended in defeat without hitting any time/node/turn/capacity
-            // boundary (even if earlier turns survived before all branches died on a later turn).
-            // Return the longest-surviving defeat route with OnlyDeathRoutes = true so UI displays "未找到生还路线"
-            // and DeathTurn reflects the exact terminal defeat turn.
+            // Keep the terminal fallback so DeathTurn remains available even after lossy pruning.
             chosenId = bestFallbackId;
             chosenKey = bestFallbackKey;
             chosenHasCompletedTurnOngoing = false;
             chosenCompletedOngoingTurn = -1;
-            onlyDeathRoutes = true;
+            onlyDeathRoutes = exhaustedAllowedPotionSearch;
             isMidTurnFallback = false;
         }
         else if (frontierExhaustedInEventDefeat)
@@ -2092,7 +2139,7 @@ internal static class HotSearchCoordinator
             chosenKey = bestFallbackKey;
             chosenHasCompletedTurnOngoing = false;
             chosenCompletedOngoingTurn = -1;
-            onlyDeathRoutes = !bestFallbackKey.Survives;
+            onlyDeathRoutes = !bestFallbackKey.Survives && exhaustedAllowedPotionSearch;
             isMidTurnFallback = false;
             if (bestFallbackKey.IsEventDefeat && boundaryReason == SearchBoundaryReason.None)
                 boundaryReason = SearchBoundaryReason.EventDefeat;
@@ -2148,7 +2195,8 @@ internal static class HotSearchCoordinator
             Gen1: Math.Max(0, GC.CollectionCount(1) - gen1Start),
             Gen2: Math.Max(0, GC.CollectionCount(2) - gen2Start),
             GcPause: GC.GetTotalPauseDuration() - gcPauseStart,
-            WasLosslesslyExhausted: wasLosslesslyExhausted);
+            WasLosslesslyExhausted: wasLosslesslyExhausted,
+            ExhaustedAllowedPotionSearch: exhaustedAllowedPotionSearch);
     }
 
     /// <summary>
@@ -2365,6 +2413,9 @@ internal static class HotSearchCoordinator
         {
             return true;
         }
+
+        if (candidate.OnlyDeathRoutes != current.OnlyDeathRoutes)
+            return candidate.OnlyDeathRoutes;
 
         if (candidate.HasCompletedTurnOngoing != current.HasCompletedTurnOngoing)
             return candidate.HasCompletedTurnOngoing;
@@ -2635,6 +2686,9 @@ internal static class HotSearchCoordinator
         if (pass.BestKey.IsEventDefeat)
             return SearchBoundaryReason.EventDefeat;
 
+        if (pass.OnlyDeathRoutes)
+            return SearchBoundaryReason.None;
+
         if (pass.BoundaryReason != SearchBoundaryReason.None)
             return pass.BoundaryReason;
 
@@ -2644,8 +2698,8 @@ internal static class HotSearchCoordinator
         if (overallNodeLimitReached || escalationBoundary == SearchBoundaryReason.NodeLimit)
             return SearchBoundaryReason.NodeLimit;
 
-        if (!pass.HasVictory && !pass.OnlyDeathRoutes)
-            return SearchBoundaryReason.TurnLimit;
+        if (!pass.HasVictory)
+            return SearchBoundaryReason.IncompleteSurvivalSearch;
 
         return SearchBoundaryReason.None;
     }

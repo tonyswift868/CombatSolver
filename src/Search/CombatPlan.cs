@@ -55,6 +55,7 @@ internal enum SearchBoundaryReason
     TurnLimit,
     NodeLimit,
     TimeLimit,
+    IncompleteSurvivalSearch,
 }
 
 internal enum SolverResultScope
