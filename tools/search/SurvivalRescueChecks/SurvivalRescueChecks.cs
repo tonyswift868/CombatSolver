@@ -227,11 +227,27 @@ internal static class SurvivalRescueChecks
         if (before.Profile != after.Profile || same == null || IsVictory(capped) || uncapped != null
             || cacheDirectory != "v2" || !legacyUntouched)
             return 1;
+        bool stoppedForMemory = false;
+        after = after with
+        {
+            MeasurePhasePerformance = true,
+            Diagnostics = new SearchDiagnosticsSink(message =>
+            {
+                if (!message.StartsWith("SURVIVAL_STOP reason=memory ", StringComparison.Ordinal))
+                    return;
+                stoppedForMemory = true;
+                Console.WriteLine(message);
+            }, _ => { }),
+        };
         var fresh = HotSearchCoordinator.Solve(root, names, damage, after, CancellationToken.None);
         Replay(combat, loop, fresh.BestNode.Actions);
         int hp = LocalContext.GetMe(combat)!.Creature.CurrentHp;
-        Console.WriteLine($"CACHE uncappedWin={IsVictory(fresh)} native={RealCombatDriver.GetLiveOutcome(combat)}:{hp}");
-        return IsVictory(fresh) && RealCombatDriver.GetLiveOutcome(combat) == HotCombatOutcome.Victory && hp > 0 ? 0 : 1;
+        HotCombatOutcome native = RealCombatDriver.GetLiveOutcome(combat);
+        Console.WriteLine($"CACHE uncappedWin={IsVictory(fresh)} native={native}:{hp} memoryStop={stoppedForMemory} boundary={fresh.BoundaryReason}");
+        bool correct = !fresh.WasRestoredFromCache && (IsVictory(fresh) && native == HotCombatOutcome.Victory && hp > 0
+            || stoppedForMemory && !fresh.OnlyDeathRoutesFound && fresh.BoundaryReason == SearchBoundaryReason.IncompleteSurvivalSearch
+                && native == HotCombatOutcome.Defeat);
+        return correct ? 0 : 1;
     }
 
     private static bool IsVictory(SolverResult result)
